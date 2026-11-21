@@ -2,6 +2,15 @@ namespace VoxCPM.Tests;
 
 public sealed class VoxCPMTests
 {
+    private sealed class TestRuntime : IVoxCpmRuntime
+    {
+        public float[] Generate(string text, GenerationOptions options)
+            => new[] { 0.25f, -0.25f };
+
+        public IEnumerable<float[]> GenerateStreaming(string text, GenerationOptions options)
+            => new[] { new[] { 0.25f }, new[] { -0.25f } };
+    }
+
     [Fact]
     public void FromPretrained_ReadsArchitectureAndSampleRate()
     {
@@ -36,6 +45,28 @@ public sealed class VoxCPMTests
 
             Assert.Throws<ArgumentException>(() => model.Generate(" "));
             Assert.Throws<NotSupportedException>(() => model.Generate("Hello"));
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public void Generate_NormalizesTextAndDelegatesToRuntime()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            File.WriteAllText(Path.Combine(directory, "config.json"),
+                """{"architecture":"voxcpm","sample_rate":44100}""");
+            using var model = VoxCPMModel.FromPretrained(directory, runtime: new TestRuntime());
+
+            var samples = model.Generate("  Hello\r\n world  ");
+
+            Assert.Equal(44100, model.SampleRate);
+            Assert.Equal(new[] { 0.25f, -0.25f }, samples);
         }
         finally
         {

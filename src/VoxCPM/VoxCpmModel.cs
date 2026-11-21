@@ -27,6 +27,11 @@ public sealed class VoxCPMModel : IDisposable
         Architecture = document.RootElement.TryGetProperty("architecture", out var architecture)
             ? architecture.GetString()?.Trim().ToLowerInvariant() ?? "voxcpm"
             : "voxcpm";
+        SampleRate = document.RootElement.TryGetProperty("sample_rate", out var sampleRate)
+            && sampleRate.TryGetInt32(out var configuredSampleRate)
+            && configuredSampleRate > 0
+            ? configuredSampleRate
+            : Architecture == "voxcpm2" ? 48000 : 16000;
 
         if (Architecture is not ("voxcpm" or "voxcpm2"))
             throw new ArgumentException($"Unsupported VoxCPM architecture: {Architecture}", nameof(modelPath));
@@ -34,7 +39,7 @@ public sealed class VoxCPMModel : IDisposable
 
     public string ModelPath { get; }
     public string Architecture { get; }
-    public int SampleRate => Architecture == "voxcpm2" ? 48000 : 16000;
+    public int SampleRate { get; }
 
     public static VoxCPMModel FromPretrained(
         string modelId,
