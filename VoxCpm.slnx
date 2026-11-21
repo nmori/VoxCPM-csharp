@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/VoxCpm/VoxCpm.csproj" />
+    <Project Path="src/VoxCpm.Cli/VoxCpm.Cli.csproj" />
+    <Project Path="src/VoxCpm.Server/VoxCpm.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/VoxCpm.Tests/VoxCpm.Tests.csproj" />
+    <Project Path="tests/VoxCpm.Server.Tests/VoxCpm.Server.Tests.csproj" />
+  </Folder>
+</Solution>

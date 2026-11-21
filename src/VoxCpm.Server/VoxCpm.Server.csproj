@@ -1,0 +1,67 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>voxcpm-tts-server</AssemblyName>
+    <RootNamespace>VoxCpm.Server</RootNamespace>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <!-- Native libtorch backend: cpu (default) or cuda. Build with -p:TorchBackend=cuda for NVIDIA GPUs. -->
+    <TorchBackend Condition="'$(TorchBackend)' == ''">cpu</TorchBackend>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="VoxCpm.Server.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\VoxCpm\VoxCpm.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="voices\README.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- Preset characters: designed voices (style + fixed seed, see voices\README.txt) saved as name.wav + name.txt
+         (its transcript: ultimate cloning), selectable out of the box. -->
+    <None Include="voices\*.wav;voices\*.txt" Exclude="voices\README.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- Licenses of everything in the package (license\README.txt): TorchSharp, LibTorch, Intel OpenMP, libuv, SkiaSharp,
+         Protobuf, SharpZipLib and the .NET / ASP.NET Core runtimes (the same set as Irodori-TTS-csharp's server). -->
+    <None Include="license\*.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE" Link="license\LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\NOTICE" Link="license\NOTICE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TorchBackend)' == 'cpu'">
+    <PackageReference Include="TorchSharp-cpu" Version="0.107.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TorchBackend)' == 'cuda' And $([MSBuild]::IsOSPlatform('Windows'))">
+    <PackageReference Include="TorchSharp-cuda-windows" Version="0.107.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TorchBackend)' == 'cuda' And $([MSBuild]::IsOSPlatform('Linux'))">
+    <PackageReference Include="TorchSharp-cuda-linux" Version="0.107.0" />
+  </ItemGroup>
+
+  <!--
+    CPU package (the distributed one, as Irodori-TTS-csharp): keep LibTorch out of the exe's folder, in libtorch-cpu\.
+    At start-up LibTorchRuntime loads either this or the CUDA build downloaded on an NVIDIA PC; both carry
+    torch_cpu.dll / c10.dll, and a copy next to the exe would be loaded as well.
+  -->
+  <Target Name="MoveCpuLibTorchToSubfolder" AfterTargets="ComputeResolvedFilesToPublishList" Condition="'$(TorchBackend)' == 'cpu' And $(RuntimeIdentifier.StartsWith('win'))">
+    <ItemGroup>
+      <_CpuLibTorch Include="@(ResolvedFileToPublish)" Condition="'%(ResolvedFileToPublish.NuGetPackageId)' == 'libtorch-cpu-win-x64'" />
+      <ResolvedFileToPublish Remove="@(_CpuLibTorch)" />
+      <ResolvedFileToPublish Include="@(_CpuLibTorch)" RelativePath="libtorch-cpu\%(Filename)%(Extension)" />
+    </ItemGroup>
+  </Target>
+
+  <!--
+    NVIDIA DLLs that come with libtorch but are not on the redistributable list (Attachment A of the CUDA EULA)
+    and that nothing in the package loads.
+  -->
+  <Target Name="DropNonRedistributableNvidiaFiles" AfterTargets="ComputeResolvedFilesToPublishList" Condition="'$(TorchBackend)' == 'cuda'">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(Filename)%(Extension)' == 'cusolverMg64_11.dll' Or '%(Filename)%(Extension)' == 'nvperf_host.dll'" />
+    </ItemGroup>
+  </Target>
+
+</Project>
