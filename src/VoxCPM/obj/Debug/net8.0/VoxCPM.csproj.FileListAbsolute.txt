@@ -1,0 +1,12 @@
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/VoxCPM.GeneratedMSBuildEditorConfig.editorconfig
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/VoxCPM.AssemblyInfoInputs.cache
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/VoxCPM.AssemblyInfo.cs
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/VoxCPM.csproj.CoreCompileInputs.cache
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/bin/Debug/net8.0/VoxCPM.deps.json
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/bin/Debug/net8.0/VoxCPM.dll
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/bin/Debug/net8.0/VoxCPM.pdb
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/VoxCPM.dll
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/refint/VoxCPM.dll
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/VoxCPM.pdb
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/ref/VoxCPM.dll
+/home/runner/work/VoxCPM-csharp/VoxCPM-csharp/src/VoxCPM/obj/Debug/net8.0/VoxCPM.csproj.Up2Date
