@@ -42,14 +42,14 @@ public sealed class VoxCpm2Model : IDisposable
     /// <summary>Sample rate the reference / prompt audio is encoded at (16 kHz).</summary>
     public int EncodeSampleRate => AudioVae.SampleRate;
 
-    private VoxCpm2Model(VoxCpmConfig cfg, VoxCpmTextTokenizer tokenizer, WeightSource w, WeightSource vae, Device device, ScalarType dtype)
+    private VoxCpm2Model(VoxCpmConfig cfg, VoxCpmTextTokenizer tokenizer, WeightSource w, WeightSource vae, Device device, ScalarType dtype, bool int8Lm)
     {
         Config = cfg;
         Tokenizer = tokenizer;
         Device = device;
         DType = dtype;
-        _baseLm = new MiniCpm4Model(cfg.LmConfig, w.Sub("base_lm"), dtype, cfg.MaxLength, embedDevice: torch.CPU);
-        _residualLm = new MiniCpm4Model(cfg.ResidualConfig(), w.Sub("residual_lm"), dtype, cfg.MaxLength);
+        _baseLm = new MiniCpm4Model(cfg.LmConfig, w.Sub("base_lm"), dtype, cfg.MaxLength, embedDevice: torch.CPU, int8: int8Lm);
+        _residualLm = new MiniCpm4Model(cfg.ResidualConfig(), w.Sub("residual_lm"), dtype, cfg.MaxLength, int8: int8Lm);
         _featEncoder = new LocalEncoder(cfg.LocalConfig(cfg.EncoderConfig), w.Sub("feat_encoder"), dtype);
         _dit = new LocalDit(cfg.LocalConfig(cfg.DitConfig), w.Sub("feat_decoder.estimator"), dtype);
         _featDecoder = new UnifiedCfm(_dit, cfg.FeatDim, cfg.DitConfig.DitMeanMode);
@@ -68,7 +68,9 @@ public sealed class VoxCpm2Model : IDisposable
     /// <c>audiovae.safetensors</c> or <c>audiovae.pth</c>).
     /// </summary>
     /// <param name="vaeDevice">Device of the AudioVAE (default: <paramref name="device"/>). The CPU frees ~0.4 GB of GPU memory.</param>
-    public static VoxCpm2Model Load(string directory, Device device, ScalarType dtype, Action<string>? log = null, Device? vaeDevice = null)
+    /// <param name="int8Lm">Keep the linear weights of the two LMs as int8 (~1.6 GB less memory, slower LM steps).</param>
+    public static VoxCpm2Model Load(string directory, Device device, ScalarType dtype, Action<string>? log = null, Device? vaeDevice = null,
+        bool int8Lm = false)
     {
         var cfg = VoxCpmConfig.Load(Path.Combine(directory, "config.json"));
         var tokenizer = VoxCpmTextTokenizer.FromDirectory(directory);
@@ -80,7 +82,7 @@ public sealed class VoxCpm2Model : IDisposable
         using var w = WeightSource.FromSafeTensors(modelPath, device);
         try
         {
-            var model = new VoxCpm2Model(cfg, tokenizer, w, vae, device, dtype);
+            var model = new VoxCpm2Model(cfg, tokenizer, w, vae, device, dtype, int8Lm);
             var unused = w.Unused().ToList();
             if (unused.Count > 0) log?.Invoke($"Unused model weights: {string.Join(", ", unused.Take(8))}{(unused.Count > 8 ? " ..." : "")}");
             var unusedVae = vae.Unused().ToList();
@@ -425,6 +427,7 @@ public sealed class VoxCpm2Model : IDisposable
         _baseLm.Dispose();
         _residualLm.Dispose();
         _featEncoder.Dispose();
+        _featDecoder.Dispose();
         _dit.Dispose();
         _fsq.Dispose();
         foreach (var l in new[] { _encToLm, _lmToDit, _resToDit, _fusionConcat, _stopProj, _stopHead }) l.Dispose();

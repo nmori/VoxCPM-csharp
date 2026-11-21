@@ -30,6 +30,38 @@ public class ModelParityTests(ModelFixture f)
         }
     }
 
+    /// <summary>
+    /// int8 LM weights (<c>--quantize int8</c>): the prefill error against the Python fp32 reference, next to that of
+    /// the default bf16 weights (measured: base 6.5e-2 vs 3.5e-2, residual 3.5e-2 vs 1.8e-2). A regression guard.
+    /// </summary>
+    [Fact]
+    public void Int8LanguageModelsStayWithinBf16Error()
+    {
+        SkipIfMissing();
+        using var _ = torch.inference_mode();
+        using var scope = torch.NewDisposeScope();
+        var cfg = f.Model!.Config;
+        using var w = WeightSource.FromSafeTensors(Path.Combine(TestPaths.Checkpoint!, "model.safetensors"), torch.CPU);
+        var x = f.R("lm.in");
+        foreach (var (name, lmCfg) in new[] { ("base", cfg.LmConfig), ("res", cfg.ResidualConfig()) })
+        {
+            var expected = f.R($"lm.{name}.prefill");
+            double RelErr(Tensor h) => ((h.to(ScalarType.Float64) - expected.to(ScalarType.Float64)).norm() / expected.to(ScalarType.Float64).norm()).item<double>();
+            double bf16, int8;
+            using (var lm = new MiniCpm4Model(lmCfg, w.Sub(name == "base" ? "base_lm" : "residual_lm"), ScalarType.BFloat16, 64))
+            {
+                bf16 = RelErr(lm.Forward(x.to(ScalarType.BFloat16), isCausal: true).Hidden.to(ScalarType.Float32));
+            }
+            using (var lm = new MiniCpm4Model(lmCfg, w.Sub(name == "base" ? "base_lm" : "residual_lm"), ScalarType.BFloat16, 64, int8: true))
+            {
+                int8 = RelErr(lm.Forward(x.to(ScalarType.BFloat16), isCausal: true).Hidden.to(ScalarType.Float32));
+            }
+            Console.Error.WriteLine($"[parity] {name} prefill relative error: bf16 {bf16:E2}, bf16+int8 {int8:E2}");
+            TestContext.Current.TestOutputHelper?.WriteLine($"{name}: bf16 {bf16:E2}, int8 {int8:E2}");
+            Assert.True(int8 <= 2.5 * bf16, $"{name}: int8 error {int8:E2} > 2.5 x bf16 error {bf16:E2}");
+        }
+    }
+
     [Fact]
     public void LocalEncoderDitFsq()
     {

@@ -23,6 +23,12 @@ public sealed class RuntimeOptions
     public string Precision { get; init; } = "auto";
     /// <summary>Device of the AudioVAE (null: the model device).</summary>
     public string? VaeDevice { get; init; }
+    /// <summary>
+    /// <c>auto</c> (default), <c>none</c> or <c>int8</c>: keep the linear weights of the base / residual LMs as int8
+    /// (a scale per 128 columns). ~1.6 GB less GPU memory, LM steps slower. auto picks int8 only when the free GPU
+    /// memory is short of what the bf16 model needs (a 4–6 GB card, or one shared with other apps).
+    /// </summary>
+    public string Quantize { get; init; } = "auto";
     public Action<string>? Log { get; init; }
 }
 
@@ -134,8 +140,55 @@ public sealed class VoxCpmRuntime : IDisposable
             torch.backends.cuda.matmul.allow_tf32 = options.Precision.Trim().Equals("tf32", StringComparison.OrdinalIgnoreCase);
         }
         var vaeDevice = options.VaeDevice is { } vd ? ResolveDevice(vd) : device;
-        var model = VoxCpm2Model.Load(options.ModelDirectory, device, dtype, options.Log, vaeDevice);
-        return new VoxCpmRuntime(model, options.Log);
+        bool int8 = ResolveQuantize(options.Quantize, device, dtype, vaeDevice, options.Log);
+        var model = VoxCpm2Model.Load(options.ModelDirectory, device, dtype, options.Log, vaeDevice, int8);
+        return new VoxCpmRuntime(model, options.Log) { Int8 = int8 };
+    }
+
+    /// <summary>Whether the LM weights are int8 (<see cref="RuntimeOptions.Quantize"/>).</summary>
+    public bool Int8 { get; private init; }
+
+    /// <summary>
+    /// GPU memory the process needs with bf16 weights, CUDA context included (measured on an RTX 4050: 5.1 GB
+    /// peak, 5.4 GB for a request with a reference voice and its transcript), and what int8 saves.
+    /// </summary>
+    internal const long Bf16Bytes = 5_600L << 20;
+    internal const long VaeBytes = 350L << 20;
+    internal const long Int8SavingBytes = 1_600L << 20;
+
+    /// <summary>
+    /// <c>none</c> / <c>int8</c>, or <c>auto</c>: int8 when the free memory of the CUDA device is less than the
+    /// bf16 model needs (another app holds part of the GPU, or a 4–6 GB card), bf16 otherwise; never on the CPU.
+    /// </summary>
+    internal static bool ResolveQuantize(string quantize, Device device, ScalarType dtype, Device vaeDevice, Action<string>? log)
+    {
+        switch (quantize.Trim().ToLowerInvariant())
+        {
+            case "none" or "off" or "false":
+                return false;
+            case "int8":
+                return true;
+            case "" or "auto":
+                if (device.type != DeviceType.CUDA || dtype != ScalarType.BFloat16) return false;
+                if (CudaMemory.TryGetInfo(device.index) is not { } info)
+                {
+                    log?.Invoke("quantize auto: GPU memory unknown, using bf16 weights");
+                    return false;
+                }
+                var (free, total) = info;
+                long need = Bf16Bytes - (vaeDevice.type == DeviceType.CUDA ? 0 : VaeBytes);
+                bool int8 = free < need;
+                log?.Invoke($"quantize auto: {free >> 20} MiB of {total >> 20} MiB GPU memory free, the bf16 model needs ~{need >> 20} MiB"
+                    + $" -> {(int8 ? "int8" : "bf16")} LM weights");
+                if (int8 && free < need - Int8SavingBytes)
+                {
+                    log?.Invoke("quantize auto: even int8 may not fit; the GPU will spill into shared memory (slow). "
+                        + "Close other GPU apps, or use --vae-device cpu / --device cpu.");
+                }
+                return int8;
+            default:
+                throw new ArgumentException($"Unsupported quantize '{quantize}'. Expected auto, none or int8.");
+        }
     }
 
     /// <summary>

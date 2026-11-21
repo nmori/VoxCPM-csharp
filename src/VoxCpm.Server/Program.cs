@@ -114,6 +114,7 @@ catch (OperationCanceledException) when (parentExited.IsCancellationRequested)
 
 if (Args.Str(opts, "threads") is string threads) torch.set_num_threads(int.Parse(threads, CultureInfo.InvariantCulture));
 string? vaeDevice = Opt("vae-device", "VOXCPM_VAE_DEVICE");
+string quantize = Opt("quantize", "VOXCPM_QUANTIZE") ?? "auto";
 string? modelPath = Opt("model-path", "VOXCPM_MODEL_PATH") ?? Args.Str(opts, "checkpoint");
 string repo = Opt("hf-model-id", "VOXCPM_HF_MODEL_ID") ?? Args.Str(opts, "hf-checkpoint") ?? VoxCpmRuntime.DefaultRepo;
 
@@ -141,9 +142,10 @@ try
         Device = device,
         Precision = precision,
         VaeDevice = vaeDevice,
+        Quantize = quantize,
         Log = Console.WriteLine,
     });
-    Console.WriteLine($"[model] loaded in {watch.Elapsed.TotalSeconds:F1} s ({tts.Device}, {tts.DType})");
+    Console.WriteLine($"[model] loaded in {watch.Elapsed.TotalSeconds:F1} s ({tts.Device}, {tts.DType}{(tts.Int8 ? ", int8 LM weights" : "")})");
 }
 catch (OperationCanceledException) when (parentExited.IsCancellationRequested)
 {
@@ -250,6 +252,7 @@ internal static class Args
           --cuda-runtime-dir <DIR>   Keep / find the CUDA build of LibTorch in DIR. Default: downloaded once, when an
                                      NVIDIA driver is present, to %VOXCPM_CACHE%\runtime or else %LOCALAPPDATA%\VoxCpm\runtime
           --vae-device <D>           AudioVAE device (default: --device)
+          --quantize <auto|none|int8> int8: LM weights as int8, ~1.6 GB less memory, slower; auto (default): int8 only when GPU memory is short (env VOXCPM_QUANTIZE)
           --threads <N>              CPU threads for libtorch
         """;
 

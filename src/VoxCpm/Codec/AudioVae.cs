@@ -222,8 +222,16 @@ public sealed class AudioVae : IDisposable
         }
         for (int i = 0; i < _decoder.Count; i++)
         {
-            if (_srCond[i] is { } cond) x = cond.Forward(x, bucket!.Value);
-            x = _decoder[i].Forward(x, state);
+            // One scope per layer: its activations are freed as soon as the layer is done (see MiniCpm4Model).
+            Tensor next;
+            using (torch.NewDisposeScope())
+            {
+                var h = x;
+                if (_srCond[i] is { } cond) h = cond.Forward(h, bucket!.Value);
+                next = _decoder[i].Forward(h, state).MoveToOuterDisposeScope();
+            }
+            if (!ReferenceEquals(x, z)) x.Dispose();
+            x = next;
             if (sw is not null)
             {
                 if (Device.type == DeviceType.CUDA) torch.cuda.synchronize();
@@ -289,9 +297,17 @@ public sealed class AudioVae : IDisposable
         private readonly IOp[] _ops;
         public Seq(params IOp[] ops) => _ops = ops;
 
+        /// <summary>Each op in its own dispose scope, so intermediate activations are freed right away.</summary>
         public Tensor Forward(Tensor x, StreamState? state)
         {
-            foreach (var op in _ops) x = op.Forward(x, state);
+            var input = x;
+            foreach (var op in _ops)
+            {
+                Tensor next;
+                using (torch.NewDisposeScope()) next = op.Forward(x, state).MoveToOuterDisposeScope();
+                if (!ReferenceEquals(x, input)) x.Dispose();
+                x = next;
+            }
             return x;
         }
 

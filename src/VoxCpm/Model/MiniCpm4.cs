@@ -27,13 +27,14 @@ internal sealed class MiniCpm4Model : IDisposable
     /// <param name="maxPositions">Positions the RoPE table must cover (the table is cut to this length).</param>
     /// <param name="embedDevice">Where the token embedding table lives (it is only read at prefill, so the CPU
     /// saves GPU memory).</param>
-    public MiniCpm4Model(MiniCpm4Config cfg, WeightSource w, ScalarType dtype, int maxPositions, Device? embedDevice = null)
+    /// <param name="int8">Keep the linear weights as int8 (see <see cref="Weight"/>): half the memory, a little slower.</param>
+    public MiniCpm4Model(MiniCpm4Config cfg, WeightSource w, ScalarType dtype, int maxPositions, Device? embedDevice = null, bool int8 = false)
     {
         _cfg = cfg;
         DType = dtype;
         if (cfg.VocabSize > 0) EmbedTokens = w.Take("embed_tokens.weight", dtype, embedDevice ?? w.Device);
         _layers = new Layer[cfg.NumHiddenLayers];
-        for (int i = 0; i < _layers.Length; i++) _layers[i] = new Layer(cfg, w.Sub($"layers.{i}"), dtype);
+        for (int i = 0; i < _layers.Length; i++) _layers[i] = new Layer(cfg, w.Sub($"layers.{i}"), dtype, int8);
         _norm = w.Take("norm.weight", dtype);
         _rope = cfg.NoRope ? null : new LongRope(cfg, w.Device, Math.Min(maxPositions, cfg.MaxPositionEmbeddings));
         _residualScale = cfg.UseMup ? cfg.ScaleDepth / Math.Sqrt(cfg.NumHiddenLayers) : 1.0;
@@ -52,10 +53,51 @@ internal sealed class MiniCpm4Model : IDisposable
         var h = x;
         foreach (var layer in _layers)
         {
-            (h, var kv) = layer.Forward(h, pos, isCausal, _residualScale);
-            cache.Add(kv);
+            Tensor next;
+            using (torch.NewDisposeScope())
+            {
+                (next, var kv) = layer.Forward(h, pos, isCausal, _residualScale);
+                next.MoveToOuterDisposeScope();
+                cache.Add((kv.Item1.MoveToOuterDisposeScope(), kv.Item2.MoveToOuterDisposeScope()));
+            }
+            h = Advance(h, next, x);
         }
         return (RmsNorm(h, _norm, _cfg.RmsNormEps), cache);
+    }
+
+    /// <summary>
+    /// The next hidden state; the previous one is freed unless it is the caller's input. Every layer runs in its
+    /// own dispose scope: TorchSharp frees a tensor only when its scope ends, so without this the activations of
+    /// all layers (and, in the callers, of a whole generation step) would stay allocated — Python frees each one
+    /// right after use. On a small GPU that difference pushes the working set into shared system memory.
+    /// </summary>
+    private static Tensor Advance(Tensor previous, Tensor next, Tensor input)
+    {
+        if (!ReferenceEquals(previous, input)) previous.Dispose();
+        return next;
+    }
+
+    /// <summary>One layer in its own dispose scope (see <see cref="Advance"/>).</summary>
+    private static Tensor Scoped(Func<Tensor> layer)
+    {
+        using var _ = torch.NewDisposeScope();
+        return layer().MoveToOuterDisposeScope();
+    }
+
+    /// <summary>
+    /// x: (B, T, H) through the bidirectional model (the local encoder / DiT): <see cref="Forward"/> without
+    /// collecting the keys / values, which saves two copies per layer.
+    /// </summary>
+    public Tensor Encode(Tensor x)
+    {
+        (Tensor Cos, Tensor Sin)? pos = _rope?.Get(0, x.shape[1]);
+        var h = x;
+        foreach (var layer in _layers)
+        {
+            var input = h;
+            h = Advance(h, Scoped(() => layer.Encode(input, pos, _residualScale)), x);
+        }
+        return RmsNorm(h, _norm, _cfg.RmsNormEps);
     }
 
     /// <summary>
@@ -69,7 +111,8 @@ internal sealed class MiniCpm4Model : IDisposable
         var h = x;
         for (int i = 0; i < _layers.Length; i++)
         {
-            h = _layers[i].ForwardStep(h, pos, position, cache.Keys[i], cache.Values[i], _residualScale);
+            var (input, layer) = (h, _layers[i]);
+            h = Advance(h, Scoped(() => layer.ForwardStep(input, pos, position, cache.Keys[i], cache.Values[i], _residualScale)), x);
         }
         return RmsNorm(h, _norm, _cfg.RmsNormEps);
     }
@@ -95,18 +138,18 @@ internal sealed class MiniCpm4Model : IDisposable
     {
         private readonly Tensor _inNorm, _postNorm;
         // q / k / v and gate / up are concatenated into one matmul each (fewer kernel launches per token).
-        private readonly Tensor _wqkv, _wo, _wGateUp, _wDown;
+        private readonly Weight _wqkv, _wo, _wGateUp, _wDown;
         private readonly int _heads, _kvHeads, _headDim, _intermediate;
         private readonly double _eps;
 
-        public Layer(MiniCpm4Config cfg, WeightSource w, ScalarType dtype)
+        public Layer(MiniCpm4Config cfg, WeightSource w, ScalarType dtype, bool int8)
         {
             _inNorm = w.Take("input_layernorm.weight", dtype);
             _postNorm = w.Take("post_attention_layernorm.weight", dtype);
-            _wqkv = Concat(w, dtype, "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight");
-            _wo = w.Take("self_attn.o_proj.weight", dtype);
-            _wGateUp = Concat(w, dtype, "mlp.gate_proj.weight", "mlp.up_proj.weight");
-            _wDown = w.Take("mlp.down_proj.weight", dtype);
+            _wqkv = Weight.Load(w, dtype, int8, "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight");
+            _wo = Weight.Load(w, dtype, int8, "self_attn.o_proj.weight");
+            _wGateUp = Weight.Load(w, dtype, int8, "mlp.gate_proj.weight", "mlp.up_proj.weight");
+            _wDown = Weight.Load(w, dtype, int8, "mlp.down_proj.weight");
             _heads = cfg.NumAttentionHeads;
             _kvHeads = cfg.NumKeyValueHeads;
             _headDim = cfg.HeadDim;
@@ -114,20 +157,10 @@ internal sealed class MiniCpm4Model : IDisposable
             _eps = cfg.RmsNormEps;
         }
 
-        /// <summary>Concatenate weights along the output dim on the CPU, then move once (no GPU temporaries).</summary>
-        private static Tensor Concat(WeightSource w, ScalarType dtype, params string[] names)
-        {
-            using var _ = torch.no_grad();
-            var parts = names.Select(n => w.Take(n, dtype, torch.CPU)).ToArray();
-            using var cat = torch.cat(parts, 0);
-            foreach (var p in parts) p.Dispose();
-            return cat.to(w.Device).DetachFromDisposeScope();
-        }
-
         /// <summary>(B, T, H + 2·KVH, D) projections → q (B, T, H, D), k / v (B, T, KVH, D), RoPE applied to q and k.</summary>
         private (Tensor Q, Tensor K, Tensor V) Project(Tensor h, long b, long t, (Tensor Cos, Tensor Sin)? pos)
         {
-            var qkv = F.linear(h, _wqkv).view(b, t, _heads + 2 * _kvHeads, _headDim);
+            var qkv = _wqkv.Linear(h).view(b, t, _heads + 2 * _kvHeads, _headDim);
             var qk = qkv.narrow(2, 0, _heads + _kvHeads);
             if (pos is { } p) qk = ApplyRotary(qk, p.Cos.unsqueeze(1), p.Sin.unsqueeze(1));
             return (qk.narrow(2, 0, _heads), qk.narrow(2, _heads, _kvHeads), qkv.narrow(2, _heads + _kvHeads, _kvHeads));
@@ -148,8 +181,23 @@ internal sealed class MiniCpm4Model : IDisposable
             var vv = groups > 1 ? v.repeat_interleave(groups, 1) : v;
             var attn = F.scaled_dot_product_attention(q, kk, vv, null, 0.0, isCausal);
             attn = attn.transpose(1, 2).contiguous().reshape(b, t, _heads * _headDim);
-            var y = Residual(x, F.linear(attn, _wo), residualScale);
+            var y = Residual(x, _wo.Linear(attn), residualScale);
             return (Residual(y, Mlp(RmsNorm(y, _postNorm, _eps)), residualScale), (k, v));
+        }
+
+        public Tensor Encode(Tensor x, (Tensor Cos, Tensor Sin)? pos, double residualScale)
+        {
+            long b = x.shape[0], t = x.shape[1];
+            var (q0, k0, v0) = Project(RmsNorm(x, _inNorm, _eps), b, t, pos);
+            var q = q0.transpose(1, 2).contiguous();
+            // repeat_interleave writes new (contiguous) tensors: the same keys / values as Forward without the copies.
+            int groups = _heads / _kvHeads;
+            var kk = groups > 1 ? k0.transpose(1, 2).repeat_interleave(groups, 1) : k0.transpose(1, 2).contiguous();
+            var vv = groups > 1 ? v0.transpose(1, 2).repeat_interleave(groups, 1) : v0.transpose(1, 2).contiguous();
+            var attn = F.scaled_dot_product_attention(q, kk, vv, null, 0.0, false);
+            attn = attn.transpose(1, 2).contiguous().reshape(b, t, _heads * _headDim);
+            var y = Residual(x, _wo.Linear(attn), residualScale);
+            return Residual(y, Mlp(RmsNorm(y, _postNorm, _eps)), residualScale);
         }
 
         public Tensor ForwardStep(Tensor x, (Tensor Cos, Tensor Sin)? pos, int position, Tensor keyCache, Tensor valueCache, double residualScale)
@@ -167,19 +215,21 @@ internal sealed class MiniCpm4Model : IDisposable
             var qg = q.reshape(b, _kvHeads, groups, _headDim);
             var attn = F.scaled_dot_product_attention(qg, keys, values, null, 0.0, false);
             attn = attn.reshape(b, _heads * _headDim);
-            var y = Residual(x, F.linear(attn, _wo), residualScale);
+            var y = Residual(x, _wo.Linear(attn), residualScale);
             return Residual(y, Mlp(RmsNorm(y, _postNorm, _eps)), residualScale);
         }
 
         private Tensor Mlp(Tensor x)
         {
-            var gu = F.linear(x, _wGateUp);
-            return F.linear(F.silu(gu.narrow(-1, 0, _intermediate)) * gu.narrow(-1, _intermediate, _intermediate), _wDown);
+            var gu = _wGateUp.Linear(x);
+            return _wDown.Linear(F.silu(gu.narrow(-1, 0, _intermediate)) * gu.narrow(-1, _intermediate, _intermediate));
         }
 
         public void Dispose()
         {
-            foreach (var t in new[] { _inNorm, _postNorm, _wqkv, _wo, _wGateUp, _wDown }) t.Dispose();
+            _inNorm.Dispose();
+            _postNorm.Dispose();
+            foreach (var w in new[] { _wqkv, _wo, _wGateUp, _wDown }) w.Dispose();
         }
     }
 

@@ -32,7 +32,7 @@ internal sealed class LocalEncoder : IDisposable
         var special = _specialToken.expand(b, t, 1, -1);
         h = torch.cat(new[] { special, h }, 2);
         h = h.reshape(b * t, h.shape[2], h.shape[3]);
-        var (outputs, _) = _encoder.Forward(h, isCausal: false);
+        var outputs = _encoder.Encode(h);
         var cls = outputs[.., 0, ..];
         return cls.reshape(b, t, -1);
     }
@@ -77,18 +77,37 @@ internal sealed class LocalDit : IDisposable
     /// </summary>
     public Tensor Forward(Tensor x, Tensor mu, Tensor t, Tensor cond, Tensor dt)
     {
-        var h = _inProj.Forward(x.transpose(1, 2).contiguous());
+        var (m, c) = Prepare(mu, cond);
+        return Forward(x, m, c, TimeEmbedding(t, dt));
+    }
+
+    /// <summary>
+    /// The parts of <see cref="Forward(Tensor, Tensor, Tensor, Tensor, Tensor)"/> that only depend on mu and the
+    /// condition frames (the same for every Euler step of a patch): mu as (N, k, H) tokens and the projected
+    /// condition (N, T', H).
+    /// </summary>
+    internal (Tensor Mu, Tensor Cond) Prepare(Tensor mu, Tensor cond)
+    {
         var c = _condProj.Forward(cond.transpose(1, 2).contiguous());
-        long prefix = c.shape[1];
+        return (mu.view(mu.shape[0], -1, _hidden), c);
+    }
 
-        var te = _time2.Forward(F.silu(_time1.Forward(SinusoidalPosEmb(t, _hidden).to(h.dtype))));
-        var de = _delta2.Forward(F.silu(_delta1.Forward(SinusoidalPosEmb(dt, _hidden).to(h.dtype))));
-        te = te + de;
+    /// <summary>The time token (N, H) for t and dt (N,) (depends only on the step of the schedule).</summary>
+    internal Tensor TimeEmbedding(Tensor t, Tensor dt)
+    {
+        var dtype = _inProj.W.dtype;
+        var te = _time2.Forward(F.silu(_time1.Forward(SinusoidalPosEmb(t, _hidden).to(dtype))));
+        var de = _delta2.Forward(F.silu(_delta1.Forward(SinusoidalPosEmb(dt, _hidden).to(dtype))));
+        return te + de;
+    }
 
-        var m = mu.view(h.shape[0], -1, h.shape[2]);
+    /// <summary>x: (N, C, T) with the prepared mu / condition tokens and time token → velocity (N, C, T).</summary>
+    internal Tensor Forward(Tensor x, Tensor m, Tensor c, Tensor te)
+    {
+        var h = _inProj.Forward(x.transpose(1, 2).contiguous());
         var seq = torch.cat(new[] { m, te.unsqueeze(1), c, h }, 1);
-        var (hidden, _) = _decoder.Forward(seq, isCausal: false);
-        hidden = hidden[.., (int)(prefix + m.shape[1] + 1).., ..];
+        var hidden = _decoder.Encode(seq);
+        hidden = hidden[.., (int)(c.shape[1] + m.shape[1] + 1).., ..];
         return _outProj.Forward(hidden).transpose(1, 2).contiguous();
     }
 
@@ -115,11 +134,12 @@ internal sealed class LocalDit : IDisposable
 /// sway-shifted schedule and classifier-free guidance with the CFG-Zero* optimized scale (and zero velocity for the
 /// first 4% of the steps).
 /// </summary>
-internal sealed class UnifiedCfm
+internal sealed class UnifiedCfm : IDisposable
 {
     private readonly LocalDit _estimator;
     private readonly int _inChannels;
     private readonly bool _meanMode;
+    private readonly Dictionary<(long Steps, long Batch, ScalarType DType, string Device, double Sway), Schedule> _schedules = new();
 
     public UnifiedCfm(LocalDit estimator, int inChannels, bool meanMode)
     {
@@ -139,35 +159,74 @@ internal sealed class UnifiedCfm
     {
         long b = mu.shape[0];
         var z = torch.randn(new long[] { b, _inChannels, patchSize }, dtype: mu.dtype, device: mu.device) * temperature;
-        var tSpan = torch.linspace(1, 0, nTimesteps + 1, dtype: mu.dtype, device: mu.device);
-        tSpan = tSpan + swaySamplingCoef * (torch.cos(Math.PI / 2 * tSpan) - 1 + tSpan);
-        return SolveEuler(z, tSpan, mu, cond, cfgValue, useCfgZeroStar);
+        return SolveEuler(z, GetSchedule(nTimesteps, b, mu.dtype, mu.device, swaySamplingCoef), mu, cond, cfgValue, useCfgZeroStar);
     }
 
-    private Tensor SolveEuler(Tensor x, Tensor tSpan, Tensor mu, Tensor cond, double cfgValue, bool useCfgZeroStar)
+    /// <summary>
+    /// The Euler steps' dt and time tokens. They only depend on the number of steps (not on the patch), so they
+    /// are computed once — with the very operations of the per-patch loop, hence the same values.
+    /// </summary>
+    private sealed class Schedule : IDisposable
     {
+        /// <summary>Per step (index 1..n-1): dt (0-d) and the [cond; uncond] time token (2B, H).</summary>
+        public required Tensor[] Dt { get; init; }
+        public required Tensor[] TimeEmbed { get; init; }
+
+        public void Dispose()
+        {
+            foreach (var t in Dt) t?.Dispose();
+            foreach (var t in TimeEmbed) t?.Dispose();
+        }
+    }
+
+    private Schedule GetSchedule(int nTimesteps, long b, ScalarType dtype, Device device, double sway)
+    {
+        var key = ((long)nTimesteps, b, dtype, device.ToString(), sway);
+        if (_schedules.TryGetValue(key, out var cached)) return cached;
+        using var scope = torch.NewDisposeScope();
+        var tSpan = torch.linspace(1, 0, nTimesteps + 1, dtype: dtype, device: device);
+        tSpan = tSpan + sway * (torch.cos(Math.PI / 2 * tSpan) - 1 + tSpan);
+        long n = tSpan.shape[0];
+        var dts = new Tensor[n];
+        var tes = new Tensor[n];
         var t = tSpan[0];
         var dt = tSpan[0] - tSpan[1];
-        long n = tSpan.shape[0];
-        int zeroInitSteps = Math.Max(1, (int)(n * 0.04));
         for (int step = 1; step < n; step++)
         {
+            dts[step] = dt.clone().DetachFromDisposeScope();
+            var tIn = t.unsqueeze(0).expand(2 * b).contiguous();
+            var dtIn = _meanMode ? dt.unsqueeze(0).expand(2 * b).contiguous() : torch.zeros(2 * b, dtype: dtype, device: device);
+            tes[step] = _estimator.TimeEmbedding(tIn, dtIn).DetachFromDisposeScope();
+            t = t - dt;
+            if (step < n - 1) dt = t - tSpan[step + 1];
+        }
+        var s = new Schedule { Dt = dts, TimeEmbed = tes };
+        _schedules[key] = s;
+        return s;
+    }
+
+    private Tensor SolveEuler(Tensor x, Schedule schedule, Tensor mu, Tensor cond, double cfgValue, bool useCfgZeroStar)
+    {
+        var input = x;
+        long n = schedule.Dt.Length;
+        int zeroInitSteps = Math.Max(1, (int)(n * 0.04));
+        long b = x.shape[0];
+        // Batch [conditional; unconditional (mu = 0)]; mu and the condition are the same for every step.
+        var (muTok, condTok) = _estimator.Prepare(torch.cat(new[] { mu, torch.zeros_like(mu) }, 0), torch.cat(new[] { cond, cond }, 0));
+        for (int step = 1; step < n; step++)
+        {
+            var dt = schedule.Dt[step];
             Tensor dphi;
             if (useCfgZeroStar && step <= zeroInitSteps)
             {
-                dphi = torch.zeros_like(x);
+                // Zero velocity: x - dt · 0 is x.
+                continue;
             }
-            else
+            // Each step in its own dispose scope, so its DiT activations are freed before the next one.
+            using var stepScope = torch.NewDisposeScope();
             {
-                long b = x.shape[0];
-                // Batch [conditional; unconditional (mu = 0)].
                 var xIn = torch.cat(new[] { x, x }, 0);
-                var muIn = torch.cat(new[] { mu, torch.zeros_like(mu) }, 0);
-                var tIn = t.unsqueeze(0).expand(2 * b).contiguous();
-                var dtIn = _meanMode ? dt.unsqueeze(0).expand(2 * b).contiguous() : torch.zeros(2 * b, dtype: x.dtype, device: x.device);
-                var condIn = torch.cat(new[] { cond, cond }, 0);
-
-                var v = _estimator.Forward(xIn, muIn, tIn, condIn, dtIn);
+                var v = _estimator.Forward(xIn, muTok, condTok, schedule.TimeEmbed[step]);
                 var pos = v[..(int)b];
                 var neg = v[(int)b..];
 
@@ -186,11 +245,17 @@ internal sealed class UnifiedCfm
                 }
                 dphi = neg * stStar + cfgValue * (pos - neg * stStar);
             }
-            x = x - dt * dphi;
-            t = t - dt;
-            if (step < n - 1) dt = t - tSpan[step + 1];
+            var next = (x - dt * dphi).MoveToOuterDisposeScope();
+            if (!ReferenceEquals(x, input)) x.Dispose();
+            x = next;
         }
         return x;
+    }
+
+    public void Dispose()
+    {
+        foreach (var s in _schedules.Values) s.Dispose();
+        _schedules.Clear();
     }
 }
 

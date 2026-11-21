@@ -31,6 +31,7 @@ if (a.Has("help") || a.Has("h") || args.Length == 0)
           --device D                 auto, cpu, cuda, cuda:N (default auto)
           --precision P              auto, fp32, tf32, bf16 (default auto: bf16 on CUDA, fp32 on CPU)
           --vae-device D             Device of the AudioVAE (default: same as --device)
+          --quantize auto|none|int8  int8: LM weights as int8 (~1.6 GB less memory, slower); auto (default): int8 only when GPU memory is short
           --threads N                CPU threads for libtorch
           --repeat N                 Synthesize N times (timing), keep the last
         """);
@@ -51,19 +52,8 @@ if (a.Int("threads") is int threads) torch.set_num_threads(threads);
 
 var sw = Stopwatch.StartNew();
 Action<string> log = m => Console.Error.WriteLine(m);
-VoxCpmRuntime tts;
-if (a.Get("model-path") is { } modelPath)
-{
-    tts = VoxCpmRuntime.Load(new RuntimeOptions
-    {
-        ModelDirectory = modelPath,
-        Device = a.Get("device") ?? "auto",
-        Precision = a.Get("precision") ?? "auto",
-        VaeDevice = a.Get("vae-device"),
-        Log = log,
-    });
-}
-else
+string? modelPath = a.Get("model-path");
+if (modelPath is null)
 {
     long lastReport = 0;
     var progress = new Progress<(string File, long Downloaded, long? Total)>(p =>
@@ -72,11 +62,19 @@ else
         lastReport = p.Downloaded;
         Console.Error.WriteLine(p.Total is long t ? $"{p.File}: {p.Downloaded >> 20} / {t >> 20} MB" : $"{p.File}: {p.Downloaded >> 20} MB");
     });
-    tts = await VoxCpmRuntime.FromHuggingFaceAsync(a.Get("hf-model-id") ?? VoxCpmRuntime.DefaultRepo,
-        a.Get("device") ?? "auto", a.Get("precision") ?? "auto", progress, log);
+    modelPath = await VoxCpm.IO.HuggingFaceHub.DownloadCheckpointAsync(a.Get("hf-model-id") ?? VoxCpmRuntime.DefaultRepo, progress);
 }
+var tts = VoxCpmRuntime.Load(new RuntimeOptions
+{
+    ModelDirectory = modelPath,
+    Device = a.Get("device") ?? "auto",
+    Precision = a.Get("precision") ?? "auto",
+    VaeDevice = a.Get("vae-device"),
+    Quantize = a.Get("quantize") ?? "auto",
+    Log = log,
+});
 using var _ = tts;
-Console.Error.WriteLine($"Loaded in {sw.Elapsed.TotalSeconds:F1} s ({tts.Device}, {tts.DType})");
+Console.Error.WriteLine($"Loaded in {sw.Elapsed.TotalSeconds:F1} s ({tts.Device}, {tts.DType}{(tts.Int8 ? ", int8 LM weights" : "")})");
 
 var request = new SynthesisRequest
 {
