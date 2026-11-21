@@ -96,6 +96,20 @@ public sealed class VoxCpmRuntime : IDisposable
         return torch.device(d);
     }
 
+    /// <summary>
+    /// The precision to use on <paramref name="device"/>: tf32 and bf16 are GPU settings, so off CUDA they become
+    /// fp32 (logged) instead of failing — e.g. "auto" device that fell back to the CPU with a GPU-oriented quality
+    /// setting (Irodori-TTS-csharp's FitPrecisionToDevice). bf16 on the CPU would run, but far slower than fp32 on
+    /// CPUs without bf16 matrix units.
+    /// </summary>
+    public static string FitPrecisionToDevice(string precision, Device device, Action<string>? log)
+    {
+        string p = precision.Trim().ToLowerInvariant();
+        if (device.type == DeviceType.CUDA || p is not ("tf32" or "bf16" or "bfloat16")) return precision;
+        log?.Invoke($"precision {precision.Trim()} needs CUDA; running on {device.type.ToString().ToLowerInvariant()} with fp32");
+        return "fp32";
+    }
+
     public static ScalarType ResolveDType(string precision, Device device)
     {
         switch (precision.Trim().ToLowerInvariant())
@@ -124,7 +138,7 @@ public sealed class VoxCpmRuntime : IDisposable
         CancellationToken cancellationToken = default)
     {
         // An unusable device / precision fails now, not after the download.
-        ResolveDType(precision, ResolveDevice(device));
+        ResolveDType(FitPrecisionToDevice(precision, ResolveDevice(device), null), ResolveDevice(device));
         var dir = await HuggingFaceHub.DownloadCheckpointAsync(repo, progress, cancellationToken).ConfigureAwait(false);
         return Load(new RuntimeOptions { ModelDirectory = dir, Device = device, Precision = precision, Log = log });
     }
@@ -133,11 +147,12 @@ public sealed class VoxCpmRuntime : IDisposable
     {
         NativeAllocator.Tune();
         var device = ResolveDevice(options.Device);
-        var dtype = ResolveDType(options.Precision, device);
+        string precision = FitPrecisionToDevice(options.Precision, device, options.Log);
+        var dtype = ResolveDType(precision, device);
         if (device.type == DeviceType.CUDA)
         {
             // Process-wide: the runtime loaded last decides.
-            torch.backends.cuda.matmul.allow_tf32 = options.Precision.Trim().Equals("tf32", StringComparison.OrdinalIgnoreCase);
+            torch.backends.cuda.matmul.allow_tf32 = precision.Trim().Equals("tf32", StringComparison.OrdinalIgnoreCase);
         }
         var vaeDevice = options.VaeDevice is { } vd ? ResolveDevice(vd) : device;
         bool int8 = ResolveQuantize(options.Quantize, device, dtype, vaeDevice, options.Log);
